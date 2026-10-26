@@ -151,6 +151,24 @@ resources:
       AutomaticFailoverEnabled:
         compare:
           is_ignored: true
+      GlobalReplicationGroupId:
+        # Describe reports membership only under status.globalReplicationGroupInfo,
+        # never back at this spec path, so an un-ignored comparison would leave
+        # latest.Spec nil against the declared value forever and drive a no-op
+        # ModifyReplicationGroup loop. Same shape as AutomaticFailoverEnabled above.
+        compare:
+          is_ignored: true
+        # Membership is set only on Create (secondary join); ModifyReplicationGroup
+        # has no such field. Emits the self==oldSelf update-admission rule.
+        is_immutable: true
+        # Resolve to the datastore's full prefixed ID at the GRG CR's
+        # status.globalReplicationGroupID (not the user-supplied suffix) via the
+        # generated GlobalReplicationGroupRef companion. Same-service, so service_name
+        # is omitted; the generated reader also gates on the referent being
+        # ACK.ResourceSynced=True with that status field populated.
+        references:
+          resource: GlobalReplicationGroup
+          path: Status.GlobalReplicationGroupID
       CacheParameterGroupName:
         # the service assigns a default parameter group when one is not requested, which
         # would otherwise be reported as a difference on every reconcile, keeping the custom
@@ -225,6 +243,8 @@ resources:
     hooks:
       sdk_read_many_post_set_output:
         template_path: hooks/replication_group/sdk_read_many_post_set_output.go.tpl
+      sdk_create_pre_build_request:
+        template_path: hooks/replication_group/sdk_create_pre_build_request.go.tpl
       sdk_delete_pre_build_request:
         template_path: hooks/replication_group/sdk_delete_pre_build_request.go.tpl
       sdk_delete_post_request:
@@ -249,6 +269,16 @@ resources:
         ModifyReplicationGroup:
           input_fields:
             ReplicationGroupDescription: Description
+    # A datastore member's role (primary/secondary) is observable only through a
+    # periodic re-read: a failover swaps it with no spec change, and the membership
+    # ID is compare.is_ignored so a role flip produces no delta and never rides the
+    # update path. requeue_on_success_seconds is the only runtime v0.67.0 mechanism
+    # that requeues after a successful Sync (applied by handleRequeues on
+    # ResourceSynced=True) rather than before updateResource. It is resource-wide --
+    # every ReplicationGroup resyncs on this interval, members and non-members alike,
+    # which is accepted because failover is rare and 10 min is a modest refresh.
+    reconcile:
+      requeue_on_success_seconds: 600
   Snapshot:
     update_conditions_custom_method_name: CustomUpdateConditions
     exceptions:
@@ -655,7 +685,6 @@ ignore:
     - ModifyUserInput.Passwords
     - ModifyReplicationGroupInput.SecurityGroupIds
     - ModifyReplicationGroupInput.EngineVersion
-    - CreateReplicationGroupInput.GlobalReplicationGroupId
     - CreateReplicationGroupInput.AutoMinorVersionUpgrade
     - CreateReplicationGroupInput.NumCacheClusters
     - CacheCluster.LogDeliveryConfigurations

@@ -21,6 +21,7 @@ from time import sleep
 
 from acktest.resources import random_suffix_name
 from acktest.k8s import resource as k8s
+from acktest.k8s import condition
 from e2e import service_marker, CRD_GROUP, CRD_VERSION, load_elasticache_resource
 from e2e.bootstrap_resources import get_bootstrap_resources
 from e2e.util import retrieve_cache_cluster, retrieve_replication_group, assert_recoverable_condition_set, retrieve_replication_group_tags
@@ -646,3 +647,383 @@ class TestReplicationGroup:
         k8s.delete_custom_resource(reference)
         sleep(DEFAULT_WAIT_SECS)
         rg_deletion_waiter.wait(ReplicationGroupId=input_dict["RG_ID"])
+
+
+# ---------------------------------------------------------------------------
+# Global Datastore membership (issue #3099)
+#
+# These cases exercise a secondary ReplicationGroup joining a GlobalReplicationGroup
+# via spec.globalReplicationGroupID (and the ref companion), the create-time guard
+# that rejects inherited fields, immutability of the membership field, and the
+# disassociate-before-delete member lifecycle. A resync-timing assertion for
+# requeue_on_success_seconds is deliberately omitted: it is a steady-state interval
+# that would make the suite slow and flaky without proving the mechanism (which is
+# covered by the manager_factory.RequeueOnSuccessSeconds() value).
+# ---------------------------------------------------------------------------
+
+RESOURCE_PLURAL_GRG = "globalreplicationgroups"
+
+GRG_CREATE_WAIT_PERIODS = 30
+GRG_CREATE_PERIOD_LENGTH = 30
+MEMBER_WAIT_PERIODS = 40
+MEMBER_PERIOD_LENGTH = 30
+DELETE_WAIT_PERIODS = 40
+DELETE_PERIOD_LENGTH = 30
+
+
+def _ec():
+    return boto3.client("elasticache")
+
+
+def _wait_rg_available(rg_id: str, periods: int = 50, length: int = 30) -> bool:
+    ec = _ec()
+    for i in range(periods):
+        try:
+            rg = ec.describe_replication_groups(
+                ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+            if rg["Status"] == "available":
+                return True
+        except Exception as e:
+            logging.warning(f"error checking ReplicationGroup {rg_id}: {e}")
+        logging.debug(f"waiting for ReplicationGroup {rg_id} available ({i})")
+        sleep(length)
+    return False
+
+
+def _get_grg(global_id: str):
+    ec = _ec()
+    try:
+        resp = ec.describe_global_replication_groups(
+            GlobalReplicationGroupId=global_id, ShowMemberInfo=True)
+    except ec.exceptions.GlobalReplicationGroupNotFoundFault:
+        return None
+    groups = resp.get("GlobalReplicationGroups") or []
+    return groups[0] if groups else None
+
+
+def _wait_grg_status(global_id: str, target: str,
+                     periods: int = GRG_CREATE_WAIT_PERIODS,
+                     length: int = GRG_CREATE_PERIOD_LENGTH) -> bool:
+    for _ in range(periods):
+        grg = _get_grg(global_id)
+        if grg is not None and grg.get("Status") == target:
+            return True
+        sleep(length)
+    return False
+
+
+def _wait_k8s_global_id(reference, periods: int = 10, length: int = 10):
+    for _ in range(periods):
+        res = k8s.get_resource(reference)
+        gid = (res or {}).get("status", {}).get("globalReplicationGroupID")
+        if gid:
+            return gid
+        sleep(length)
+    return None
+
+
+def _grg_member_role(global_id: str, rg_id: str):
+    grg = _get_grg(global_id)
+    if grg is None:
+        return None
+    for m in grg.get("Members") or []:
+        if m.get("ReplicationGroupId") == rg_id:
+            return m.get("Role")
+    return None
+
+
+def _create_primary_rg(rg_id: str) -> "k8s.CustomResourceReference":
+    """Create a datastore-eligible primary ReplicationGroup and wait for available."""
+    rg_resource = load_elasticache_resource(
+        "replicationgroup_create_delete_grg",
+        additional_replacements={
+            "RG_ID": rg_id,
+            "ENGINE_VERSION": "7.0",
+            "NUM_NODE_GROUPS": "1",
+            "REPLICAS_PER_NODE_GROUP": "1",
+        },
+    )
+    reference = k8s.CustomResourceReference(
+        CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL, rg_id, namespace="default")
+    _ = k8s.create_custom_resource(reference, rg_resource)
+    assert k8s.wait_resource_consumed_by_controller(
+        reference, wait_periods=15, period_length=20) is not None
+    assert _wait_rg_available(rg_id), f"primary RG {rg_id} did not become available"
+    return reference
+
+
+def _create_grg(grg_name: str, suffix: str, primary_rg_id: str):
+    grg_resource = load_elasticache_resource(
+        "global_replication_group_basic",
+        additional_replacements={
+            "GRG_NAME": grg_name,
+            "GRG_SUFFIX": suffix,
+            "PRIMARY_RG_ID": primary_rg_id,
+            "DESCRIPTION": "ACK E2E #3099 datastore for RG membership",
+        },
+    )
+    reference = k8s.CustomResourceReference(
+        CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL_GRG, grg_name, namespace="default")
+    _ = k8s.create_custom_resource(reference, grg_resource)
+    assert k8s.wait_resource_consumed_by_controller(
+        reference, wait_periods=15, period_length=20) is not None
+    global_id = _wait_k8s_global_id(reference)
+    assert global_id is not None, "GRG status.globalReplicationGroupID was never set"
+    assert _wait_grg_status(global_id, "primary-only"), \
+        f"GRG {global_id} did not reach primary-only"
+    assert k8s.wait_on_condition(
+        reference, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True",
+        wait_periods=10, period_length=15), "GRG did not reach Synced"
+    return reference, global_id
+
+
+@service_marker
+class TestReplicationGroupGlobalDatastoreMember:
+    def test_secondary_join_and_member_delete(self, make_rg_name):
+        """A secondary joins by ID, reads back the field, then disassociates on delete."""
+        primary_id = make_rg_name("ack-e2e-3099-pri")
+        secondary_id = make_rg_name("ack-e2e-3099-sec")
+        grg_name = f"grg-3099-{random_suffix_name('mem', 12)}"
+        suffix = random_suffix_name("ack-e2e-3099", 20)
+
+        primary_ref = _create_primary_rg(primary_id)
+        grg_ref, global_id = _create_grg(grg_name, suffix, primary_id)
+
+        # Secondary join by the full datastore ID.
+        sec_resource = load_elasticache_resource(
+            "replicationgroup_create_delete_grg_secondary",
+            additional_replacements={
+                "RG_ID": secondary_id,
+                "GRG_ID": global_id,
+                "REPLICAS_PER_NODE_GROUP": "1",
+            },
+        )
+        sec_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL, secondary_id, namespace="default")
+        _ = k8s.create_custom_resource(sec_ref, sec_resource)
+        assert k8s.wait_resource_consumed_by_controller(
+            sec_ref, wait_periods=15, period_length=20) is not None
+        assert _wait_rg_available(secondary_id), \
+            f"secondary RG {secondary_id} did not become available"
+        assert k8s.wait_on_condition(
+            sec_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True",
+            wait_periods=MEMBER_WAIT_PERIODS, period_length=MEMBER_PERIOD_LENGTH), \
+            "secondary did not reach Synced"
+
+        # Dual verification: the CR reads the field back, AND AWS reports membership.
+        cr = k8s.get_resource(sec_ref)
+        assert cr["spec"].get("globalReplicationGroupID") == global_id
+        assert (cr.get("status") or {}).get("globalReplicationGroupInfo", {}) \
+            .get("globalReplicationGroupID") == global_id
+        assert _grg_member_role(global_id, secondary_id) is not None, \
+            "AWS does not list the secondary as a datastore member"
+
+        # Delete the secondary: the delete hook disassociates first, then deletes.
+        # Polling the CR's removal is a complete proof -- the finalizer only comes
+        # off once Describe reports the RG gone.
+        _, removed = k8s.delete_custom_resource(
+            sec_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert removed, f"secondary RG CR {secondary_id} was not removed"
+        assert _grg_member_role(global_id, secondary_id) is None, \
+            "AWS still lists the secondary as a member after delete"
+
+        # Tear down: deleting a primary-member RG while the datastore still exists
+        # must requeue (not terminal) with the "delete the GlobalReplicationGroup
+        # first" message. Delete the datastore first, then the primary survives.
+        _, grg_removed = k8s.delete_custom_resource(
+            grg_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert grg_removed, f"GRG CR {grg_name} was not removed"
+        assert _wait_rg_available(primary_id), \
+            "primary RG should survive the datastore's deletion"
+        _, pri_removed = k8s.delete_custom_resource(
+            primary_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert pri_removed, f"primary RG CR {primary_id} was not removed"
+
+    def test_secondary_join_by_reference(self, make_rg_name):
+        """globalReplicationGroupRef resolves to the full prefixed datastore ID."""
+        primary_id = make_rg_name("ack-e2e-3099r-pri")
+        secondary_id = make_rg_name("ack-e2e-3099r-sec")
+        grg_name = f"grg-3099r-{random_suffix_name('ref', 12)}"
+        suffix = random_suffix_name("ack-e2e-3099r", 20)
+
+        primary_ref = _create_primary_rg(primary_id)
+        grg_ref, global_id = _create_grg(grg_name, suffix, primary_id)
+
+        sec_resource = load_elasticache_resource(
+            "replicationgroup_create_delete_grg_secondary_ref",
+            additional_replacements={
+                "RG_ID": secondary_id,
+                "GRG_REF_NAME": grg_name,
+                "REPLICAS_PER_NODE_GROUP": "1",
+            },
+        )
+        sec_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL, secondary_id, namespace="default")
+        _ = k8s.create_custom_resource(sec_ref, sec_resource)
+        assert k8s.wait_resource_consumed_by_controller(
+            sec_ref, wait_periods=15, period_length=20) is not None
+        assert _wait_rg_available(secondary_id), \
+            f"secondary RG {secondary_id} (ref) did not become available"
+        assert k8s.wait_on_condition(
+            sec_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True",
+            wait_periods=MEMBER_WAIT_PERIODS, period_length=MEMBER_PERIOD_LENGTH), \
+            "secondary (ref) did not reach Synced"
+
+        # The ref resolved to the FULL prefixed ID (longer than the suffix), not the
+        # user-supplied suffix.
+        assert _grg_member_role(global_id, secondary_id) is not None, \
+            "AWS does not list the ref-joined secondary as a member"
+        assert suffix in global_id and len(global_id) > len(suffix)
+
+        _, removed = k8s.delete_custom_resource(
+            sec_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert removed, f"secondary RG CR {secondary_id} (ref) was not removed"
+        _, grg_removed = k8s.delete_custom_resource(
+            grg_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert grg_removed, f"GRG CR {grg_name} (ref) was not removed"
+        assert _wait_rg_available(primary_id)
+        _, pri_removed = k8s.delete_custom_resource(
+            primary_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert pri_removed, f"primary RG CR {primary_id} (ref) was not removed"
+
+    def test_create_rejection_inherited_fields(self, make_rg_name):
+        """A join with inherited fields set is rejected terminal and never created."""
+        primary_id = make_rg_name("ack-e2e-3099x-pri")
+        bad_id = make_rg_name("ack-e2e-3099x-bad")
+        grg_name = f"grg-3099x-{random_suffix_name('rej', 12)}"
+        suffix = random_suffix_name("ack-e2e-3099x", 20)
+
+        primary_ref = _create_primary_rg(primary_id)
+        grg_ref, global_id = _create_grg(grg_name, suffix, primary_id)
+
+        bad_resource = load_elasticache_resource(
+            "replicationgroup_create_delete_grg_secondary_invalid",
+            additional_replacements={
+                "RG_ID": bad_id,
+                "GRG_ID": global_id,
+                "REPLICAS_PER_NODE_GROUP": "1",
+            },
+        )
+        bad_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL, bad_id, namespace="default")
+        _ = k8s.create_custom_resource(bad_ref, bad_resource)
+        assert k8s.wait_resource_consumed_by_controller(
+            bad_ref, wait_periods=10, period_length=15) is not None
+
+        assert k8s.wait_on_condition(
+            bad_ref, condition.CONDITION_TYPE_TERMINAL, "True",
+            wait_periods=10, period_length=10), \
+            "an inherited-field join did not surface ACK.Terminal=True"
+        terminal = k8s.get_resource_condition(bad_ref, condition.CONDITION_TYPE_TERMINAL)
+        msg = (terminal or {}).get("message") or ""
+        assert "inherited from the" in msg, \
+            f"ACK.Terminal does not name the inherited-field rejection: {terminal}"
+        # The rejected resource was never created in AWS.
+        ec = _ec()
+        try:
+            ec.describe_replication_groups(ReplicationGroupId=bad_id)
+            raise AssertionError(f"rejected RG {bad_id} was created in AWS")
+        except ec.exceptions.ReplicationGroupNotFoundFault:
+            pass
+
+        _, removed = k8s.delete_custom_resource(
+            bad_ref, wait_periods=12, period_length=5)
+        assert removed, f"rejected RG CR {bad_id} was not removed"
+        _, grg_removed = k8s.delete_custom_resource(
+            grg_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert grg_removed, f"GRG CR {grg_name} (reject) was not removed"
+        assert _wait_rg_available(primary_id)
+        _, pri_removed = k8s.delete_custom_resource(
+            primary_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert pri_removed, f"primary RG CR {primary_id} (reject) was not removed"
+
+    def test_bare_secondary_is_accepted(self, make_rg_name):
+        """A bare join (only ID + replicasPerNodeGroup) is accepted -- the guard's inverse."""
+        primary_id = make_rg_name("ack-e2e-3099b-pri")
+        secondary_id = make_rg_name("ack-e2e-3099b-sec")
+        grg_name = f"grg-3099b-{random_suffix_name('bare', 12)}"
+        suffix = random_suffix_name("ack-e2e-3099b", 20)
+
+        primary_ref = _create_primary_rg(primary_id)
+        grg_ref, global_id = _create_grg(grg_name, suffix, primary_id)
+
+        sec_resource = load_elasticache_resource(
+            "replicationgroup_create_delete_grg_secondary",
+            additional_replacements={
+                "RG_ID": secondary_id,
+                "GRG_ID": global_id,
+                "REPLICAS_PER_NODE_GROUP": "1",
+            },
+        )
+        sec_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL, secondary_id, namespace="default")
+        _ = k8s.create_custom_resource(sec_ref, sec_resource)
+        assert k8s.wait_resource_consumed_by_controller(
+            sec_ref, wait_periods=15, period_length=20) is not None
+        assert _wait_rg_available(secondary_id), \
+            f"bare secondary RG {secondary_id} did not become available"
+        assert k8s.wait_on_condition(
+            sec_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True",
+            wait_periods=MEMBER_WAIT_PERIODS, period_length=MEMBER_PERIOD_LENGTH), \
+            "bare secondary was not accepted"
+        # A bare join must NOT have surfaced the terminal guard.
+        terminal = k8s.get_resource_condition(sec_ref, condition.CONDITION_TYPE_TERMINAL)
+        assert terminal is None or terminal.get("status") != "True", \
+            f"bare secondary wrongly rejected: {terminal}"
+
+        _, removed = k8s.delete_custom_resource(
+            sec_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert removed, f"bare secondary RG CR {secondary_id} was not removed"
+        _, grg_removed = k8s.delete_custom_resource(
+            grg_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert grg_removed, f"GRG CR {grg_name} (bare) was not removed"
+        assert _wait_rg_available(primary_id)
+        _, pri_removed = k8s.delete_custom_resource(
+            primary_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert pri_removed, f"primary RG CR {primary_id} (bare) was not removed"
+
+    def test_membership_field_is_immutable(self, make_rg_name):
+        """Patching spec.globalReplicationGroupID is rejected by the CEL update rule."""
+        primary_id = make_rg_name("ack-e2e-3099i-pri")
+        secondary_id = make_rg_name("ack-e2e-3099i-sec")
+        grg_name = f"grg-3099i-{random_suffix_name('imm', 12)}"
+        suffix = random_suffix_name("ack-e2e-3099i", 20)
+
+        primary_ref = _create_primary_rg(primary_id)
+        grg_ref, global_id = _create_grg(grg_name, suffix, primary_id)
+
+        sec_resource = load_elasticache_resource(
+            "replicationgroup_create_delete_grg_secondary",
+            additional_replacements={
+                "RG_ID": secondary_id,
+                "GRG_ID": global_id,
+                "REPLICAS_PER_NODE_GROUP": "1",
+            },
+        )
+        sec_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL, secondary_id, namespace="default")
+        _ = k8s.create_custom_resource(sec_ref, sec_resource)
+        assert k8s.wait_resource_consumed_by_controller(
+            sec_ref, wait_periods=15, period_length=20) is not None
+        assert _wait_rg_available(secondary_id)
+
+        # The CEL rule self==oldSelf rejects any change to the membership field.
+        rejected = False
+        try:
+            k8s.patch_custom_resource(
+                sec_ref, {"spec": {"globalReplicationGroupID": "sgaui-someother-id"}})
+        except Exception as e:
+            rejected = True
+            logging.debug(f"immutable patch rejected as expected: {e}")
+        assert rejected, "patching the immutable globalReplicationGroupID was not rejected"
+
+        _, removed = k8s.delete_custom_resource(
+            sec_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert removed, f"secondary RG CR {secondary_id} (imm) was not removed"
+        _, grg_removed = k8s.delete_custom_resource(
+            grg_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert grg_removed, f"GRG CR {grg_name} (imm) was not removed"
+        assert _wait_rg_available(primary_id)
+        _, pri_removed = k8s.delete_custom_resource(
+            primary_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
+        assert pri_removed, f"primary RG CR {primary_id} (imm) was not removed"

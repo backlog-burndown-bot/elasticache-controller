@@ -57,11 +57,12 @@ const (
 )
 
 var (
-	condMsgCurrentlyCreating      string = "replication group currently being created."
-	condMsgCurrentlyDeleting      string = "replication group currently being deleted."
-	condMsgNoDeleteWhileModifying string = "replication group currently being modified. cannot delete."
-	condMsgTerminalCreateFailed   string = "replication group in create-failed status."
-	condMsgDurabilityModifying    string = "replication group durability update in progress."
+	condMsgCurrentlyCreating       string = "replication group currently being created."
+	condMsgCurrentlyDeleting       string = "replication group currently being deleted."
+	condMsgCurrentlyDisassociating string = "replication group currently being disassociated from its global datastore."
+	condMsgNoDeleteWhileModifying  string = "replication group currently being modified. cannot delete."
+	condMsgTerminalCreateFailed    string = "replication group in create-failed status."
+	condMsgDurabilityModifying     string = "replication group durability update in progress."
 )
 
 const (
@@ -78,6 +79,12 @@ var (
 	)
 	requeueWaitWhileModifying = ackrequeue.NeededAfter(
 		errors.New("Modify is in progress."),
+		ackrequeue.DefaultRequeueAfterDuration,
+	)
+	// Distinct from requeueWaitWhileDeleting ("Delete is in progress."): the delete
+	// has not started here, it is blocked on the member leaving the datastore.
+	requeueWaitWhileDisassociating = ackrequeue.NeededAfter(
+		errors.New("replication group is disassociating from its global datastore"),
 		ackrequeue.DefaultRequeueAfterDuration,
 	)
 )
@@ -153,6 +160,14 @@ func (rm *resourceManager) CustomDescribeReplicationGroupsSetOutput(
 	}
 	elem := resp.ReplicationGroups[0]
 	rm.customSetOutput(ctx, elem, ko)
+	// Membership comes back only under status.globalReplicationGroupInfo, never at
+	// the spec path. Echo it into spec only for a member the user actually manages,
+	// so the adopt path can fill it in without the controller claiming the field on
+	// a manifest that never declared it.
+	ko.Spec.GlobalReplicationGroupID = observedIfManaged(
+		r.ko.Spec.GlobalReplicationGroupID,
+		observedGlobalReplicationGroupID(ko),
+	)
 	err := rm.customSetOutputSupplementAPIs(ctx, r, &elem, ko)
 	if err != nil {
 		return nil, err

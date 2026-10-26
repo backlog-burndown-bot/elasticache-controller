@@ -1,0 +1,17 @@
+# Secondary replication group that joins a Global Datastore by reference.
+#
+# globalReplicationGroupRef resolves to the referent GRG's
+# status.globalReplicationGroupID (the full prefixed datastore ID), not the
+# user-supplied suffix. The referent must be ACK.ResourceSynced=True before the
+# join resolves.
+apiVersion: elasticache.services.k8s.aws/v1alpha1
+kind: ReplicationGroup
+metadata:
+  name: $RG_ID
+spec:
+  replicationGroupID: $RG_ID
+  description: secondary member joined by reference
+  globalReplicationGroupRef:
+    from:
+      name: $GRG_REF_NAME
+  replicasPerNodeGroup: $REPLICAS_PER_NODE_GROUP

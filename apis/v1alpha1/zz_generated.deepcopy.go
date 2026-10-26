@@ -3043,6 +3043,16 @@ func (in *ReplicationGroupSpec) DeepCopyInto(out *ReplicationGroupSpec) {
 		*out = new(string)
 		**out = **in
 	}
+	if in.GlobalReplicationGroupID != nil {
+		in, out := &in.GlobalReplicationGroupID, &out.GlobalReplicationGroupID
+		*out = new(string)
+		**out = **in
+	}
+	if in.GlobalReplicationGroupRef != nil {
+		in, out := &in.GlobalReplicationGroupRef, &out.GlobalReplicationGroupRef
+		*out = new(corev1alpha1.AWSResourceReferenceWrapper)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.IPDiscovery != nil {
 		in, out := &in.IPDiscovery, &out.IPDiscovery
 		*out = new(string)

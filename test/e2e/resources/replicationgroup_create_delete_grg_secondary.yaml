@@ -1,0 +1,15 @@
+# Secondary replication group that joins a Global Datastore.
+#
+# A member inherits engine, engine version, node type, shard count and automatic
+# failover from the datastore, so none of them may be set here -- only the
+# membership (by $GRG_ID or, in the ref case, by $GRG_REF_NAME) and the replica
+# count. The controller rejects any inherited field set alongside the join.
+apiVersion: elasticache.services.k8s.aws/v1alpha1
+kind: ReplicationGroup
+metadata:
+  name: $RG_ID
+spec:
+  replicationGroupID: $RG_ID
+  description: secondary member of global datastore
+  globalReplicationGroupID: $GRG_ID
+  replicasPerNodeGroup: $REPLICAS_PER_NODE_GROUP

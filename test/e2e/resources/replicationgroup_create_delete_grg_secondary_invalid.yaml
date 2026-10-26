@@ -1,0 +1,14 @@
+# A malformed datastore join: it sets cacheNodeType and engine, which a member
+# inherits from the datastore. The controller must reject this with an
+# ACK.Terminal condition rather than send it to CreateReplicationGroup.
+apiVersion: elasticache.services.k8s.aws/v1alpha1
+kind: ReplicationGroup
+metadata:
+  name: $RG_ID
+spec:
+  replicationGroupID: $RG_ID
+  description: invalid secondary with inherited fields set
+  globalReplicationGroupID: $GRG_ID
+  replicasPerNodeGroup: $REPLICAS_PER_NODE_GROUP
+  cacheNodeType: cache.r6g.large
+  engine: redis

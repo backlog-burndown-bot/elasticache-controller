@@ -58,6 +58,10 @@ func (rm *resourceManager) ClearResolvedReferences(res acktypes.AWSResource) ack
 		ko.Spec.CacheSubnetGroupName = nil
 	}
 
+	if ko.Spec.GlobalReplicationGroupRef != nil {
+		ko.Spec.GlobalReplicationGroupID = nil
+	}
+
 	if ko.Spec.KMSKeyRef != nil {
 		ko.Spec.KMSKeyID = nil
 	}
@@ -109,6 +113,12 @@ func (rm *resourceManager) ResolveReferences(
 		resourceHasReferences = resourceHasReferences || fieldHasReferences
 	}
 
+	if fieldHasReferences, err := rm.resolveReferenceForGlobalReplicationGroupID(ctx, apiReader, ko); err != nil {
+		return &resource{ko}, (resourceHasReferences || fieldHasReferences), err
+	} else {
+		resourceHasReferences = resourceHasReferences || fieldHasReferences
+	}
+
 	if fieldHasReferences, err := rm.resolveReferenceForKMSKeyID(ctx, apiReader, ko); err != nil {
 		return &resource{ko}, (resourceHasReferences || fieldHasReferences), err
 	} else {
@@ -152,6 +162,10 @@ func validateReferenceFields(ko *svcapitypes.ReplicationGroup) error {
 
 	if ko.Spec.CacheSubnetGroupRef != nil && ko.Spec.CacheSubnetGroupName != nil {
 		return ackerr.ResourceReferenceAndIDNotSupportedFor("CacheSubnetGroupName", "CacheSubnetGroupRef")
+	}
+
+	if ko.Spec.GlobalReplicationGroupRef != nil && ko.Spec.GlobalReplicationGroupID != nil {
+		return ackerr.ResourceReferenceAndIDNotSupportedFor("GlobalReplicationGroupID", "GlobalReplicationGroupRef")
 	}
 
 	if ko.Spec.KMSKeyRef != nil && ko.Spec.KMSKeyID != nil {
@@ -348,6 +362,94 @@ func getReferencedResourceState_CacheSubnetGroup(
 			"CacheSubnetGroup",
 			namespace, name,
 			"Spec.CacheSubnetGroupName")
+	}
+	return nil
+}
+
+// resolveReferenceForGlobalReplicationGroupID reads the resource referenced
+// from GlobalReplicationGroupRef field and sets the GlobalReplicationGroupID
+// from referenced resource. Returns a boolean indicating whether a reference
+// contains references, or an error
+func (rm *resourceManager) resolveReferenceForGlobalReplicationGroupID(
+	ctx context.Context,
+	apiReader client.Reader,
+	ko *svcapitypes.ReplicationGroup,
+) (hasReferences bool, err error) {
+	if ko.Spec.GlobalReplicationGroupRef != nil && ko.Spec.GlobalReplicationGroupRef.From != nil {
+		hasReferences = true
+		arr := ko.Spec.GlobalReplicationGroupRef.From
+		if arr.Name == nil || *arr.Name == "" {
+			return hasReferences, fmt.Errorf("provided resource reference is nil or empty: GlobalReplicationGroupRef")
+		}
+		namespace, _, err := ackrt.ValidateCrossNamespaceReference(
+			rm.cfg.EnableCrossNamespace,
+			ko.ObjectMeta.GetNamespace(),
+			arr.Namespace,
+			*arr.Name,
+		)
+		if err != nil {
+			return hasReferences, err
+		}
+		obj := &svcapitypes.GlobalReplicationGroup{}
+		if err := getReferencedResourceState_GlobalReplicationGroup(ctx, apiReader, obj, *arr.Name, namespace); err != nil {
+			return hasReferences, err
+		}
+		ko.Spec.GlobalReplicationGroupID = (*string)(obj.Status.GlobalReplicationGroupID)
+	}
+
+	return hasReferences, nil
+}
+
+// getReferencedResourceState_GlobalReplicationGroup looks up whether a referenced resource
+// exists and is in a ACK.ResourceSynced=True state. If the referenced resource does exist and is
+// in a Synced state, returns nil, otherwise returns `ackerr.ResourceReferenceTerminalFor` or
+// `ResourceReferenceNotSyncedFor` depending on if the resource is in a Terminal state.
+func getReferencedResourceState_GlobalReplicationGroup(
+	ctx context.Context,
+	apiReader client.Reader,
+	obj *svcapitypes.GlobalReplicationGroup,
+	name string, // the Kubernetes name of the referenced resource
+	namespace string, // the Kubernetes namespace of the referenced resource
+) error {
+	namespacedName := types.NamespacedName{
+		Namespace: namespace,
+		Name:      name,
+	}
+	err := apiReader.Get(ctx, namespacedName, obj)
+	if err != nil {
+		return err
+	}
+	var refResourceTerminal bool
+	for _, cond := range obj.Status.Conditions {
+		if cond.Type == ackv1alpha1.ConditionTypeTerminal &&
+			cond.Status == corev1.ConditionTrue {
+			return ackerr.ResourceReferenceTerminalFor(
+				"GlobalReplicationGroup",
+				namespace, name)
+		}
+	}
+	if refResourceTerminal {
+		return ackerr.ResourceReferenceTerminalFor(
+			"GlobalReplicationGroup",
+			namespace, name)
+	}
+	var refResourceSynced bool
+	for _, cond := range obj.Status.Conditions {
+		if cond.Type == ackv1alpha1.ConditionTypeResourceSynced &&
+			cond.Status == corev1.ConditionTrue {
+			refResourceSynced = true
+		}
+	}
+	if !refResourceSynced {
+		return ackerr.ResourceReferenceNotSyncedFor(
+			"GlobalReplicationGroup",
+			namespace, name)
+	}
+	if obj.Status.GlobalReplicationGroupID == nil {
+		return ackerr.ResourceReferenceMissingTargetFieldFor(
+			"GlobalReplicationGroup",
+			namespace, name,
+			"Status.GlobalReplicationGroupID")
 	}
 	return nil
 }

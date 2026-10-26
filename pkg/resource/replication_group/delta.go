@@ -125,6 +125,9 @@ func newResourceDelta(
 			delta.Add("Spec.EngineVersion", a.ko.Spec.EngineVersion, b.ko.Spec.EngineVersion)
 		}
 	}
+	if !equality.Semantic.Equalities.DeepEqual(a.ko.Spec.GlobalReplicationGroupRef, b.ko.Spec.GlobalReplicationGroupRef) {
+		delta.Add("Spec.GlobalReplicationGroupRef", a.ko.Spec.GlobalReplicationGroupRef, b.ko.Spec.GlobalReplicationGroupRef)
+	}
 	if ackcompare.HasNilDifference(a.ko.Spec.IPDiscovery, b.ko.Spec.IPDiscovery) {
 		delta.Add("Spec.IPDiscovery", a.ko.Spec.IPDiscovery, b.ko.Spec.IPDiscovery)
 	} else if a.ko.Spec.IPDiscovery != nil && b.ko.Spec.IPDiscovery != nil {

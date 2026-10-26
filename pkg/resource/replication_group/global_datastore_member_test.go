@@ -14,14 +14,25 @@
 package replication_group
 
 import (
+	"errors"
 	"testing"
 
+	ackv1alpha1 "github.com/aws-controllers-k8s/runtime/apis/core/v1alpha1"
 	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
+	ackerr "github.com/aws-controllers-k8s/runtime/pkg/errors"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/elasticache"
+	svcsdktypes "github.com/aws/aws-sdk-go-v2/service/elasticache/types"
+	smithy "github.com/aws/smithy-go"
 
 	svcapitypes "github.com/aws-controllers-k8s/elasticache-controller/apis/v1alpha1"
 )
+
+// isTerminal reports whether err is (or wraps) an ACK TerminalError.
+func isTerminal(err error) bool {
+	var te *ackerr.TerminalError
+	return errors.As(err, &te)
+}
 
 func newMemberTestRG(grgID *string) *resource {
 	ko := &svcapitypes.ReplicationGroup{}
@@ -137,5 +148,159 @@ func TestStripDatastoreOwnedInput(t *testing.T) {
 	stripDatastoreOwnedInput(in, newMemberTestRG(nil))
 	if in.CacheNodeType == nil || in.AutoMinorVersionUpgrade == nil {
 		t.Error("non-member input was modified")
+	}
+}
+
+// joinRG builds a replication group manifest requesting a datastore join, with
+// the minimum valid shape (one replica), that individual cases then perturb.
+func joinRG() *resource {
+	return &resource{ko: &svcapitypes.ReplicationGroup{
+		Spec: svcapitypes.ReplicationGroupSpec{
+			GlobalReplicationGroupID: aws.String("sgaui-grg"),
+			ReplicasPerNodeGroup:     aws.Int64(1),
+		},
+	}}
+}
+
+func TestRequestsDatastoreJoin(t *testing.T) {
+	none := &resource{ko: &svcapitypes.ReplicationGroup{}}
+	if requestsDatastoreJoin(none) {
+		t.Error("no ID and no ref: should not be a join")
+	}
+	byID := &resource{ko: &svcapitypes.ReplicationGroup{}}
+	byID.ko.Spec.GlobalReplicationGroupID = aws.String("sgaui-grg")
+	if !requestsDatastoreJoin(byID) {
+		t.Error("concrete ID: should be a join")
+	}
+	byRef := &resource{ko: &svcapitypes.ReplicationGroup{}}
+	byRef.ko.Spec.GlobalReplicationGroupRef = &ackv1alpha1.AWSResourceReferenceWrapper{}
+	if !requestsDatastoreJoin(byRef) {
+		t.Error("ref only: should be a join")
+	}
+}
+
+func TestRejectInheritedFieldsOnDatastoreJoin(t *testing.T) {
+	// A bare join with one replica is accepted.
+	if err := rejectInheritedFieldsOnDatastoreJoin(joinRG()); err != nil {
+		t.Errorf("bare join rejected: %v", err)
+	}
+
+	// A non-member manifest is never touched, even with inherited fields set.
+	nonMember := &resource{ko: &svcapitypes.ReplicationGroup{}}
+	nonMember.ko.Spec.Engine = aws.String("redis")
+	if err := rejectInheritedFieldsOnDatastoreJoin(nonMember); err != nil {
+		t.Errorf("non-member rejected: %v", err)
+	}
+
+	inherited := map[string]func(*resource){
+		"engine":                   func(r *resource) { r.ko.Spec.Engine = aws.String("redis") },
+		"engineVersion":            func(r *resource) { r.ko.Spec.EngineVersion = aws.String("7.1") },
+		"cacheNodeType":            func(r *resource) { r.ko.Spec.CacheNodeType = aws.String("cache.r6g.large") },
+		"numNodeGroups":            func(r *resource) { r.ko.Spec.NumNodeGroups = aws.Int64(2) },
+		"automaticFailoverEnabled": func(r *resource) { r.ko.Spec.AutomaticFailoverEnabled = aws.Bool(true) },
+	}
+	for name, set := range inherited {
+		t.Run("rejects inherited "+name, func(t *testing.T) {
+			r := joinRG()
+			set(r)
+			err := rejectInheritedFieldsOnDatastoreJoin(r)
+			if err == nil {
+				t.Fatalf("%s set alongside join: expected a terminal error", name)
+			}
+			if !isTerminal(err) {
+				t.Errorf("%s: error is not terminal: %v", name, err)
+			}
+		})
+	}
+
+	t.Run("rejects missing replicasPerNodeGroup", func(t *testing.T) {
+		r := joinRG()
+		r.ko.Spec.ReplicasPerNodeGroup = nil
+		if err := rejectInheritedFieldsOnDatastoreJoin(r); !isTerminal(err) {
+			t.Errorf("nil replicasPerNodeGroup: want terminal error, got %v", err)
+		}
+	})
+
+	t.Run("rejects zero replicasPerNodeGroup", func(t *testing.T) {
+		r := joinRG()
+		r.ko.Spec.ReplicasPerNodeGroup = aws.Int64(0)
+		if err := rejectInheritedFieldsOnDatastoreJoin(r); !isTerminal(err) {
+			t.Errorf("zero replicasPerNodeGroup: want terminal error, got %v", err)
+		}
+	})
+}
+
+func TestObservedGlobalReplicationGroupID(t *testing.T) {
+	ko := &svcapitypes.ReplicationGroup{}
+	if observedGlobalReplicationGroupID(ko) != nil {
+		t.Error("no info: want nil")
+	}
+	ko.Status.GlobalReplicationGroupInfo = &svcapitypes.GlobalReplicationGroupInfo{
+		GlobalReplicationGroupID: aws.String(""),
+	}
+	if observedGlobalReplicationGroupID(ko) != nil {
+		t.Error("empty ID: want nil")
+	}
+	ko.Status.GlobalReplicationGroupInfo.GlobalReplicationGroupID = aws.String("sgaui-grg")
+	if got := observedGlobalReplicationGroupID(ko); got == nil || *got != "sgaui-grg" {
+		t.Errorf("populated ID: got %v, want sgaui-grg", got)
+	}
+}
+
+func TestObservedIfManaged(t *testing.T) {
+	// Unmanaged (desired nil): never echo the observed value into spec.
+	if got := observedIfManaged(nil, aws.String("sgaui-grg")); got != nil {
+		t.Errorf("desired nil: want nil, got %v", got)
+	}
+	// Managed: echo the observed value, even when it diverges from desired (the
+	// field is immutable, so the observed datastore ID is the only correct value).
+	if got := observedIfManaged(aws.String("declared"), aws.String("sgaui-grg")); got == nil || *got != "sgaui-grg" {
+		t.Errorf("desired set: want the observed value, got %v", got)
+	}
+	// Managed but AWS reports standalone (observed nil): leaves spec nil, so under
+	// compare.is_ignored there is no delta.
+	if got := observedIfManaged(aws.String("declared"), nil); got != nil {
+		t.Errorf("observed nil: want nil, got %v", got)
+	}
+}
+
+func TestFindMemberByReplicationGroupID(t *testing.T) {
+	members := []svcsdktypes.GlobalReplicationGroupMember{
+		{ReplicationGroupId: aws.String("rg-a"), ReplicationGroupRegion: aws.String("us-east-1"), Role: aws.String("SECONDARY")},
+		{ReplicationGroupId: aws.String("rg-b"), ReplicationGroupRegion: aws.String("us-west-2"), Role: aws.String("PRIMARY")},
+	}
+	m, found := findMemberByReplicationGroupID(members, aws.String("rg-b"))
+	if !found || aws.ToString(m.ReplicationGroupRegion) != "us-west-2" {
+		t.Errorf("rg-b: found=%t region=%q, want true/us-west-2", found, aws.ToString(m.ReplicationGroupRegion))
+	}
+	if _, found := findMemberByReplicationGroupID(members, aws.String("rg-missing")); found {
+		t.Error("rg-missing: want not found")
+	}
+	if _, found := findMemberByReplicationGroupID(members, nil); found {
+		t.Error("nil id: want not found")
+	}
+}
+
+func TestErrorMatchers(t *testing.T) {
+	if isGlobalReplicationGroupNotFound(nil) || isInvalidGlobalReplicationGroupState(nil) {
+		t.Error("nil error matched")
+	}
+	notFound := &svcsdktypes.GlobalReplicationGroupNotFoundFault{}
+	if !isGlobalReplicationGroupNotFound(notFound) {
+		t.Error("GlobalReplicationGroupNotFoundFault not matched")
+	}
+	stateFault := &svcsdktypes.InvalidGlobalReplicationGroupStateFault{}
+	if !isInvalidGlobalReplicationGroupState(stateFault) {
+		t.Error("InvalidGlobalReplicationGroupStateFault not matched")
+	}
+	// The code-only variant AWS also returns, with no Fault suffix on the code.
+	byCode := &smithy.GenericAPIError{Code: "InvalidGlobalReplicationGroupState"}
+	if !isInvalidGlobalReplicationGroupState(byCode) {
+		t.Error("InvalidGlobalReplicationGroupState code not matched")
+	}
+	// A different fault must not match either matcher.
+	other := &smithy.GenericAPIError{Code: "SomethingElse"}
+	if isGlobalReplicationGroupNotFound(other) || isInvalidGlobalReplicationGroupState(other) {
+		t.Error("unrelated fault matched")
 	}
 }

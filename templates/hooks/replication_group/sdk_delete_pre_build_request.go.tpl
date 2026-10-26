@@ -30,3 +30,23 @@
 		// TODO: return err as nil when reconciler is updated.
 		return r, requeueWaitWhileModifying
 	}
+
+	// A datastore member cannot be deleted until it has left the datastore. A
+	// secondary is disassociated first (and the delete deferred until the next
+	// ReadOne shows it gone); a primary cannot be disassociated at all and defers
+	// with a message telling the user to delete the GlobalReplicationGroup first.
+	// Sources region and role authoritatively from the datastore member list,
+	// because the RG read-back carries neither.
+	if isGlobalDatastoreMember(r) {
+		requeueErr, err := rm.disassociateDatastoreMemberBeforeDelete(ctx, r)
+		if err != nil {
+			return r, err
+		}
+		if requeueErr != nil {
+			// Same contract as the guards above: pair the requeue with
+			// SetSynced(False) so the reconciler requeues the delete rather than
+			// marking the resource unmanaged.
+			ackcondition.SetSynced(r, corev1.ConditionFalse, &condMsgCurrentlyDisassociating, nil)
+			return r, requeueErr
+		}
+	}
