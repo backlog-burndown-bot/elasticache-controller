@@ -827,9 +827,8 @@ class TestReplicationGroupGlobalDatastoreMember:
         assert _grg_member_role(global_id, secondary_id) is None, \
             "AWS still lists the secondary as a member after delete"
 
-        # Tear down: deleting a primary-member RG while the datastore still exists
-        # must requeue (not terminal) with the "delete the GlobalReplicationGroup
-        # first" message. Delete the datastore first, then the primary survives.
+        # Tear down: delete the datastore first (it retains its primary), then the
+        # primary. The primary-member-delete requeue path is not exercised here.
         _, grg_removed = k8s.delete_custom_resource(
             grg_ref, wait_periods=DELETE_WAIT_PERIODS, period_length=DELETE_PERIOD_LENGTH)
         assert grg_removed, f"GRG CR {grg_name} was not removed"
